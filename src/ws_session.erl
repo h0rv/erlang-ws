@@ -35,7 +35,7 @@
 
 -export([start_link/1, start/1]).
 -export([activate/1]).
--export([send/2, close/2, close/3, stop/1]).
+-export([send/2, send_sync/3, close/2, close/3, stop/1]).
 
 -export([init/1, callback_mode/0, terminate/3, code_change/4]).
 -export([ready_wait/3, open/3, closing/3]).
@@ -112,6 +112,17 @@ activate(Pid) ->
 send(Pid, FrameOrFrames) ->
     gen_statem:cast(Pid, {send, frames(FrameOrFrames)}).
 
+-spec send_sync(pid(), ws_frame:frame() | [ws_frame:frame()], pos_integer()) ->
+    ok | {error, term()}.
+send_sync(Pid, FrameOrFrames, Timeout) when is_integer(Timeout), Timeout > 0 ->
+    try gen_statem:call(Pid, {send_sync, frames(FrameOrFrames)}, Timeout)
+    catch
+        exit:{timeout, _} ->
+            exit(Pid, kill),
+            {error, timeout};
+        exit:_ -> {error, closed}
+    end.
+
 -spec close(pid(), ws_close:code()) -> ok.
 close(Pid, Code) -> close(Pid, Code, <<>>).
 
@@ -187,6 +198,8 @@ ready_wait(cast, activate, St = #st{pending = Bin}) when Bin =/= <<>> ->
     %% bytes) until the drain has run, keeping the coalesced frame first.
     {next_state, open, St#st{pending = <<>>},
      [{next_event, internal, {drain, Bin}}]};
+ready_wait({call, From}, {send_sync, Frames}, St) ->
+    sync_send(From, Frames, St);
 ready_wait(cast, {send, Frames}, St) ->
     case send_frames(Frames, St) of
         {ok, St2} -> {keep_state, St2};
@@ -242,6 +255,8 @@ open(info, Msg, St = #st{transport_mod = TM, handle = H, parser = P,
                     {stop, Reason, St#st{handler_state = HState2}}
             end
     end;
+open({call, From}, {send_sync, Frames}, St) ->
+    sync_send(From, Frames, St);
 open(cast, {send, Frames}, St) ->
     case send_frames(Frames, St) of
         {ok, St2} -> {keep_state, St2};
@@ -277,6 +292,8 @@ closing(info, Msg, St = #st{transport_mod = TM, handle = H, parser = P}) ->
 closing(state_timeout, close, St) ->
     %% Peer never completed the close handshake within `close_timeout'.
     finish_close(St);
+closing({call, From}, {send_sync, _}, _St) ->
+    {keep_state_and_data, [{reply, From, {error, closing}}]};
 closing(cast, {send, _}, _St) ->
     keep_state_and_data;
 closing(cast, {close, _C, _R}, _St) ->
@@ -427,6 +444,14 @@ maybe_handler_info(HMod, Msg, HState) ->
 
 frames(L) when is_list(L) -> L;
 frames(F) -> [F].
+
+sync_send(From, Frames, St) ->
+    case send_frames(Frames, St) of
+        {ok, St2} -> {keep_state, St2, [{reply, From, ok}]};
+        {error, Reason} ->
+            {stop_and_reply, {transport_error, Reason},
+             [{reply, From, {error, Reason}}], St}
+    end.
 
 send_frames([], St) -> {ok, St};
 send_frames([F | Rest], St = #st{transport_mod = TM, handle = H, role = Role,
