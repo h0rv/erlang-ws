@@ -20,16 +20,43 @@
 -module(ws_transport_gen_tcp).
 -behaviour(ws_transport).
 
--export([send/2, activate/1, close/1, controlling_process/2, peername/1]).
+-export([send/2, send/3, abort/1, activate/1, close/1, controlling_process/2, peername/1]).
 -export([classify/2, recv/2]).
 
+%% A timed-out send may have written only part of a WebSocket frame.
+%% Do not use send_timeout_close: the inet driver can retain its output
+%% after that close. Abort explicitly while the socket is still open.
 send(Sock, Data) ->
-    gen_tcp:send(Sock, Data).
+    send(Sock, Data, 5000).
+
+send(Sock, Data, Timeout) ->
+    case inet:setopts(Sock, [{send_timeout, Timeout}, {send_timeout_close, false}]) of
+        ok ->
+            case gen_tcp:send(Sock, Data) of
+                ok -> ok;
+                {error, _} = Error -> abort(Sock), Error
+            end;
+        {error, _} = Error -> abort(Sock), Error
+    end.
 
 activate(Sock) ->
     inet:setopts(Sock, [{active, once}]).
 
+%% WebSocket shutdown is terminal: if the driver still has output, drop
+%% it BEFORE closing. Even positive linger followed by exit(Port, kill)
+%% cannot reclaim an inet port once it has entered its closing state.
+%% With no driver output, preserve ordinary TCP FIN and kernel draining.
+%% There is no producer racing this check: the session owns all writes.
 close(Sock) ->
+    case inet:getstat(Sock, [send_pend]) of
+        {ok, [{send_pend, 0}]} ->
+            _ = inet:setopts(Sock, [{linger, {false, 0}}]),
+            gen_tcp:close(Sock);
+        _ -> abort(Sock)
+    end.
+
+abort(Sock) ->
+    _ = inet:setopts(Sock, [{linger, {true, 0}}]),
     gen_tcp:close(Sock).
 
 controlling_process(Sock, Pid) ->
