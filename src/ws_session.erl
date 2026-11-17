@@ -35,7 +35,7 @@
 
 -export([start_link/1, start/1]).
 -export([activate/1]).
--export([send/2, close/2, close/3, stop/1]).
+-export([send/2, send_sync/3, abort/1, close/2, close/3, stop/1]).
 
 -export([init/1, callback_mode/0, terminate/3, code_change/4]).
 -export([ready_wait/3, open/3, closing/3]).
@@ -112,6 +112,28 @@ activate(Pid) ->
 send(Pid, FrameOrFrames) ->
     gen_statem:cast(Pid, {send, frames(FrameOrFrames)}).
 
+-spec send_sync(pid(), ws_frame:frame() | [ws_frame:frame()], pos_integer()) ->
+    ok | {error, term()}.
+send_sync(Pid, FrameOrFrames, Timeout) when is_integer(Timeout), Timeout > 0 ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    %% The transport owns the send deadline and aborts before replying.
+    %% A call timeout (or killing the owner) cannot establish cleanup.
+    %% Admission/backlog and handler execution are not bounded by this API.
+    try gen_statem:call(Pid, {send_sync, frames(FrameOrFrames), Deadline}, infinity)
+    catch exit:_ -> {error, closed}
+    end.
+
+%% Bounded for transports implementing send/3 and abort/1, with no
+%% unbounded handler callback or backlog ahead of this request.
+-spec abort(pid()) -> ok | {error, term()}.
+abort(Pid) ->
+    try gen_statem:call(Pid, abort, 7000)
+    catch exit:{noproc, _} -> ok;
+          exit:{normal, _} -> ok;
+          exit:{{shutdown, _}, _} -> ok;
+          exit:Reason -> {error, Reason}
+    end.
+
 -spec close(pid(), ws_close:code()) -> ok.
 close(Pid, Code) -> close(Pid, Code, <<>>).
 
@@ -129,6 +151,7 @@ callback_mode() -> state_functions.
 
 init(#{transport := TM, handle := H, role := Role,
        handler := HMod} = Opts) ->
+    {module, TM} = code:ensure_loaded(TM),
     ParserOpts = maps:get(parser_opts, Opts, #{}),
     Deflate = case maps:get(deflate, Opts, undefined) of
         undefined -> undefined;
@@ -187,10 +210,13 @@ ready_wait(cast, activate, St = #st{pending = Bin}) when Bin =/= <<>> ->
     %% bytes) until the drain has run, keeping the coalesced frame first.
     {next_state, open, St#st{pending = <<>>},
      [{next_event, internal, {drain, Bin}}]};
+ready_wait({call, From}, abort, St) -> abort_session(From, St);
+ready_wait({call, From}, {send_sync, Frames, Deadline}, St) ->
+    sync_send(From, Frames, Deadline, St);
 ready_wait(cast, {send, Frames}, St) ->
     case send_frames(Frames, St) of
         {ok, St2} -> {keep_state, St2};
-        {error, Reason} -> {stop, Reason, St}
+        {error, Reason} -> {stop, {shutdown, {transport_error, Reason}}, St}
     end;
 ready_wait(cast, {close, Code, Reason}, St) ->
     initiate_close(Code, Reason, St);
@@ -242,10 +268,13 @@ open(info, Msg, St = #st{transport_mod = TM, handle = H, parser = P,
                     {stop, Reason, St#st{handler_state = HState2}}
             end
     end;
+open({call, From}, abort, St) -> abort_session(From, St);
+open({call, From}, {send_sync, Frames, Deadline}, St) ->
+    sync_send(From, Frames, Deadline, St);
 open(cast, {send, Frames}, St) ->
     case send_frames(Frames, St) of
         {ok, St2} -> {keep_state, St2};
-        {error, Reason} -> {stop, Reason, St}
+        {error, Reason} -> {stop, {shutdown, {transport_error, Reason}}, St}
     end;
 open(cast, {close, Code, Reason}, St) ->
     initiate_close(Code, Reason, St);
@@ -277,6 +306,9 @@ closing(info, Msg, St = #st{transport_mod = TM, handle = H, parser = P}) ->
 closing(state_timeout, close, St) ->
     %% Peer never completed the close handshake within `close_timeout'.
     finish_close(St);
+closing({call, From}, abort, St) -> abort_session(From, St);
+closing({call, From}, {send_sync, _, _}, _St) ->
+    {keep_state_and_data, [{reply, From, {error, closing}}]};
 closing(cast, {send, _}, _St) ->
     keep_state_and_data;
 closing(cast, {close, _C, _R}, _St) ->
@@ -377,7 +409,7 @@ close_echo(Code) ->
 initiate_close(Code, Reason, St = #st{close_sent = false}) ->
     case send_frames([{close, Code, Reason}], St#st{close_sent = true}) of
         {ok, St2} -> {next_state, closing, St2, closing_actions(St2)};
-        {error, R} -> {stop, R, St}
+        {error, R} -> {stop, {shutdown, {transport_error, R}}, St}
     end;
 initiate_close(_C, _R, St) ->
     {keep_state, St}.
@@ -428,13 +460,52 @@ maybe_handler_info(HMod, Msg, HState) ->
 frames(L) when is_list(L) -> L;
 frames(F) -> [F].
 
-send_frames([], St) -> {ok, St};
+abort_session(From, St) ->
+    abort_transport(St),
+    {stop_and_reply, normal, [{reply, From, ok}], St}.
+
+abort_transport(#st{transport_mod = TM, handle = H}) ->
+    case erlang:function_exported(TM, abort, 1) of
+        true -> TM:abort(H);
+        false -> TM:close(H)
+    end.
+
+sync_send(From, Frames, Deadline, St = #st{transport_mod = TM}) ->
+    %% Do not turn a call timeout into a claim about an unbounded legacy
+    %% send/2. Such transports remain usable through the legacy cast API.
+    case erlang:function_exported(TM, send, 3) andalso
+         erlang:function_exported(TM, abort, 1) of
+        true -> bounded_sync_send(From, Frames, Deadline, St);
+        false -> {keep_state_and_data, [{reply, From, {error, unsupported_transport}}]}
+    end.
+
+bounded_sync_send(From, Frames, Deadline, St) ->
+    case send_frames(Frames, St, Deadline) of
+        {ok, St2} -> {keep_state, St2, [{reply, From, ok}]};
+        {error, Reason} ->
+            {stop_and_reply, {shutdown, {transport_error, Reason}},
+             [{reply, From, {error, Reason}}], St}
+    end.
+
+send_frames(Frames, St) ->
+    send_frames(Frames, St, erlang:monotonic_time(millisecond) + 5000).
+
+send_frames([], St, _Deadline) -> {ok, St};
 send_frames([F | Rest], St = #st{transport_mod = TM, handle = H, role = Role,
-                                 deflate = Deflate}) ->
+                                 deflate = Deflate}, Deadline) ->
     Iolist = encode_out(F, Role, Deflate),
-    case TM:send(H, Iolist) of
-        ok -> send_frames(Rest, St);
-        {error, _} = E -> E
+    Remaining = Deadline - erlang:monotonic_time(millisecond),
+    Result = case Remaining =< 0 of
+        true -> {error, timeout};
+        false ->
+            case erlang:function_exported(TM, send, 3) of
+                true -> TM:send(H, Iolist, Remaining);
+                false -> TM:send(H, Iolist)
+            end
+    end,
+    case Result of
+        ok -> send_frames(Rest, St, Deadline);
+        {error, _} = E -> abort_transport(St), E
     end.
 
 %% With permessage-deflate negotiated, data frames go out compressed
@@ -465,8 +536,14 @@ init_deflate_state(Negotiated, Role, ParserOpts) ->
       max_inflate => maps:get(max_message, ParserOpts,
                               ?WS_DEFAULT_MAX_MESSAGE_SIZE)}.
 
-terminate(Reason, _StateName, #st{handler_mod = HMod, handler_state = HS,
-                                  peer_close = PeerClose}) ->
+terminate(Reason, _StateName, St = #st{handler_mod = HMod, handler_state = HS,
+                                  peer_close = PeerClose, transport_mod = TM,
+                                  handle = H}) ->
+    %% Also covers stop/1 and failures that did not pass finish_close/1.
+    _ = case Reason of
+        normal -> TM:close(H);
+        _ -> abort_transport(St)
+    end,
     %% Surface the peer's close frame to the handler: {remote, Code,
     %% Reason} when it carried a status code, `remote' for a bare
     %% close. Other shutdowns pass the raw reason through.

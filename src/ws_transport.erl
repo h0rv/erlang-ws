@@ -30,6 +30,11 @@
 -module(ws_transport).
 
 -callback send(Handle :: term(), iodata()) -> ok | {error, term()}.
+%% Optional bounded transport operations. send/3 must abort partial output
+%% on failure. abort/1 must discard queued output, rather than linger.
+%% Legacy transports with only send/2 do not provide these guarantees.
+-callback send(Handle :: term(), iodata(), non_neg_integer()) -> ok | {error, term()}.
+-callback abort(Handle :: term()) -> ok.
 -callback activate(Handle :: term()) -> ok | {error, term()}.
 -callback close(Handle :: term()) -> ok.
 -callback controlling_process(Handle :: term(), pid()) ->
@@ -51,4 +56,4 @@
 -callback peername(Handle :: term()) ->
     {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 
--optional_callbacks([recv/2, peername/1]).
+-optional_callbacks([recv/2, peername/1, send/3, abort/1]).
